@@ -357,6 +357,24 @@ class WpImport extends Command
 
 
     /**
+     * Finds an existing article by its unique destination route.
+     */
+    protected function findArticlePage( string $slug ): ?Page
+    {
+        $page = Page::withTrashed()
+            ->where( 'domain', $this->domain )
+            ->where( 'path', $slug )
+            ->first();
+
+        if( $page?->trashed() ) {
+            $page->restore();
+        }
+
+        return $page;
+    }
+
+
+    /**
      * Finds a WordPress attachment matching the given image URL.
      */
     /**
@@ -385,9 +403,16 @@ class WpImport extends Command
         $optName = $this->option( 'blog-name' );
         $blogName = is_string( $optName ) ? $optName : 'Blog';
 
-        $page = Page::where( 'path', $blogPath )->first();
+        $page = Page::withTrashed()
+            ->where( 'domain', $this->domain )
+            ->where( 'path', $blogPath )
+            ->first();
 
         if( $page ) {
+            if( $page->trashed() ) {
+                $page->restore();
+            }
+
             $this->info( "Using existing blog page: {$page->name} (/{$blogPath})" );
             return $page;
         }
@@ -405,7 +430,7 @@ class WpImport extends Command
             ],
         ] );
 
-        if( $root = Page::where( 'tag', 'root' )->first() ) {
+        if( $root = Page::where( 'tag', 'root' )->where( 'domain', $this->domain )->first() ) {
             $page->appendToNode( $root )->save();
         }
 
@@ -569,11 +594,13 @@ class WpImport extends Command
     /**
      * Imports a single WordPress post as a Pagible blog article page.
      */
-    protected function importPost( object $post, Page $blogPage ): void
+    protected function importPost( object $post, Page $blogPage ): bool
     {
         $slug = $post->post_name ?: Utils::slugify( $post->post_title ); // @phpstan-ignore-line property.notFound
         $title = html_entity_decode( $post->post_title, ENT_QUOTES, 'UTF-8' ); // @phpstan-ignore-line property.notFound
         $intro = $post->post_excerpt ?: $this->extractIntro( $post->post_content ); // @phpstan-ignore-line property.notFound
+        $page = $this->findArticlePage( $slug );
+        $updated = $page !== null;
 
         $content = $this->parseContent( $post->post_content ); // @phpstan-ignore property.notFound
         $coverFileId = $this->importFeaturedImage( $post->ID ); // @phpstan-ignore property.notFound
@@ -582,12 +609,19 @@ class WpImport extends Command
         $fileIds = $this->collectFileIds( $content['fileIds'], $coverFileId );
         $pageData = $this->buildPageData( $title, $slug );
 
-        $page = $this->createArticlePage( $pageData, $contentElements, $blogPage );
+        if( !$page ) {
+            $page = $this->createArticlePage( $pageData, $contentElements, $blogPage );
+        } elseif( $page->parent_id !== $blogPage->id ) {
+            $page->appendToNode( $blogPage )->save();
+        }
+
         $this->createArticleVersion( $page, $pageData, $contentElements, $fileIds );
 
         if( $post->post_date && $post->post_date !== '0000-00-00 00:00:00' ) { // @phpstan-ignore property.notFound
             $page->update( ['created_at' => $post->post_date] );
         }
+
+        return $updated;
     }
 
 
@@ -597,24 +631,27 @@ class WpImport extends Command
     protected function importPosts( \Illuminate\Database\Query\Builder $query, Page $blogPage, int $total ): void
     {
         $imported = 0;
+        $updated = 0;
 
-        $query->chunk( 100, function( $posts ) use ( $blogPage, &$imported ) {
+        $query->chunk( 100, function( $posts ) use ( $blogPage, &$imported, &$updated ) {
             foreach( $posts as $post )
             {
                 try {
-                    DB::connection( config( 'cms.db', 'sqlite' ) )->transaction( function() use ( $post, $blogPage ) {
-                        $this->importPost( $post, $blogPage );
+                    $existing = DB::connection( config( 'cms.db', 'sqlite' ) )->transaction( function() use ( $post, $blogPage ) {
+                        return $this->importPost( $post, $blogPage );
                     } );
 
-                    $imported++;
-                    $this->info( "  Imported: {$post->post_title}" );
+                    $existing ? $updated++ : $imported++;
+                    $action = $existing ? 'Updated' : 'Imported';
+                    $this->info( "  {$action}: {$post->post_title}" );
                 } catch( \Exception $e ) {
                     $this->error( "  Failed to import [{$post->ID}] {$post->post_title}: " . $e->getMessage() );
                 }
             }
         } );
 
-        $this->info( "Import complete. {$imported}/{$total} posts imported." );
+        $processed = $imported + $updated;
+        $this->info( "Import complete. {$imported} imported, {$updated} updated ({$processed}/{$total} posts processed)." );
     }
 
 

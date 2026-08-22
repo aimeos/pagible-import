@@ -79,6 +79,8 @@ body text. Extension-specific plugin behavior is not migrated.
 ## cms:wp-import
 
 Imports WordPress posts into Pagible CMS as blog article pages.
+Re-importing the same domain and post slug updates and republishes the existing
+article instead of creating another page.
 
 ### Command
 
